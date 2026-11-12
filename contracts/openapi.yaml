@@ -1,0 +1,386 @@
+openapi: 3.1.0
+info:
+  title: Chance audit API
+  version: 0.1.0
+  description: |
+    The audit log of Chance: an append-only, per-tenant record of every business event the other services publish,
+    readable by the tenant admin. The log is filled from events only; this API has no endpoint that writes.
+
+    - Every endpoint except the health probes needs a bearer JWT issued by the identity provider, with the realm
+      role `tenant-admin`. The tenant of the caller comes only from the token (claim `organization`), never from the
+      request: there is no tenant in any path, query or header, so an admin can read only the log of their own tenant.
+    - Errors are RFC 9457 `application/problem+json`. A token that is wrong is answered `401`, a token without the
+      role `tenant-admin` (or without a tenant) `403`.
+    - Every entry is chained to the one before it by a SHA-256 hash (see `contracts/README.md`);
+      `GET /v1/audit/verify` recomputes the chain of the caller's tenant.
+    - The gateway routes the prefix `/v1/audit`; the health paths are not routed by the gateway.
+servers:
+  - url: http://localhost:8080
+    description: Local run
+tags:
+  - name: Audit
+    description: The log of the caller's tenant
+  - name: Health
+    description: Kubernetes probes
+security:
+  - bearerAuth: []
+
+paths:
+  /v1/audit:
+    get:
+      tags: [Audit]
+      operationId: listAuditEntries
+      summary: List the entries of the caller's tenant, newest first
+      description: |
+        Tenant admin only. The entries are ordered by `seq`, highest first, and filtered by every parameter that is
+        given (all of them together). A page holds at most `limit` entries; when more follow, `nextCursor` is set, and
+        passing it as `cursor` gives the next, older page. A new entry that is appended while a client pages through
+        the log does not move the pages that are still to come, because the cursor is a position in `seq`.
+        An event type that audit has not seen before is listed like any other.
+      parameters:
+        - name: type
+          in: query
+          required: false
+          description: |
+            Exact event type, for example `si.chance.markets.MarketOpened.v1`. Repeat the parameter
+            (`type=a&type=b`) or give a comma-separated list (`type=a,b`) to match any of several types. At most 20 types.
+          style: form
+          explode: true
+          schema:
+            type: array
+            maxItems: 20
+            items:
+              type: string
+              minLength: 1
+              maxLength: 255
+        - name: from
+          in: query
+          required: false
+          description: Only entries that occurred at or after this time (`occurredAt`, ISO 8601 with a zone)
+          schema:
+            type: string
+            format: date-time
+        - name: to
+          in: query
+          required: false
+          description: Only entries that occurred before or at this time (`occurredAt`, ISO 8601 with a zone)
+          schema:
+            type: string
+            format: date-time
+        - name: correlationId
+          in: query
+          required: false
+          description: Only the entries of one business transaction (for example a market's resolution and the payouts that follow)
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 255
+        - name: actor
+          in: query
+          required: false
+          description: Only entries caused by this user (the `actor` of the entry)
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 255
+        - name: subject
+          in: query
+          required: false
+          description: "Only entries about this id (the `subject` of the entry, which is a market, deposit, withdrawal, user or the tenant)"
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 255
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: A page of entries
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuditPage'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+  /v1/audit/verify:
+    get:
+      tags: [Audit]
+      operationId: verifyAuditChain
+      summary: Recompute the hash chain of the caller's tenant
+      description: |
+        Tenant admin only. Reads every entry of the tenant in order of `seq` and checks that the numbers run 1, 2, 3
+        without a gap, that each entry names the hash of the one before it (the first one the genesis hash of 64
+        zeros) and that each stored hash is the hash of the entry's fields. It answers whether the chain is intact
+        (`valid`), how many entries it checked (`entries`, all of them, also those after the first wrong one) and the
+        `seq` of the first wrong entry (`brokenAtSeq`, for a removed entry the one after the gap), or null. It cannot
+        see entries that were cut off at the end of the log: keep the `hash` of the newest entry elsewhere to notice that.
+      responses:
+        '200':
+          description: The result of the check (also when the chain is broken)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/VerifyResult'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+  /health/startup:
+    get:
+      tags: [Health]
+      operationId: healthStartup
+      summary: Startup probe
+      description: Answers once the service has applied its migrations and listens.
+      security: []
+      responses:
+        '200':
+          description: Started
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Health'
+  /health/ready:
+    get:
+      tags: [Health]
+      operationId: healthReady
+      summary: Readiness probe
+      description: |
+        Pings the service's own database only (always ready with the in-memory store). The message broker is not
+        checked: audit keeps serving its log while the broker is away. Answers 503 from the moment the process gets
+        SIGTERM until it exits, so the load balancer stops sending requests before the server closes.
+      security: []
+      responses:
+        '200':
+          description: Ready
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Health'
+        '503':
+          description: The database does not answer (`not_ready`), or the service is shutting down (`shutting_down`)
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+  /health/live:
+    get:
+      tags: [Health]
+      operationId: healthLive
+      summary: Liveness probe
+      description: Process only. It never touches the database.
+      security: []
+      responses:
+        '200':
+          description: Alive
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Health'
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        JWT from the identity provider, verified against its JWKS (issuer, audience and signature).
+        The token holds exactly one organization: the tenant is its alias in the `organization` claim, and the tenant
+        role (`tenant-admin` or `trader`) is the one group of that organization in `organization.<alias>.groups`
+        (`/tenant-admin` or `/trader`). `platform-admin` is a realm role in the realm roles claim; a `tenant-admin` or
+        `trader` realm role is ignored. The audit endpoints need `tenant-admin`.
+
+  parameters:
+    Limit:
+      name: limit
+      in: query
+      required: false
+      description: Page size
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 100
+        default: 50
+    Cursor:
+      name: cursor
+      in: query
+      required: false
+      description: Opaque cursor from `nextCursor` of the previous page
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 512
+
+  responses:
+    BadRequest:
+      description: The request is invalid (a filter, `limit` or `cursor` that is not allowed); `errors` names the fields
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    Unauthorized:
+      description: The bearer token is missing or invalid
+      headers:
+        WWW-Authenticate:
+          description: Bearer challenge
+          schema:
+            type: string
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    Forbidden:
+      description: The token lacks the role `tenant-admin`, or names no tenant
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    ServiceUnavailable:
+      description: |
+        Either the signing keys of the identity provider cannot be fetched (code `identity_provider_unavailable`: the
+        token cannot be checked, and is not necessarily wrong), or the tenant has no log yet because its TenantCreated
+        event has not been processed (code `tenant_not_ready`), or, for `GET /v1/audit/verify` only, the service is
+        running as many verifications as it allows at once (code `verify_busy`). Try again after the time in
+        `Retry-After`. A token that
+        is wrong (expired, bad signature, wrong issuer or audience, unknown key id, malformed) is answered `401`.
+      headers:
+        Retry-After:
+          description: Seconds to wait before the request is repeated
+          schema:
+            type: integer
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+
+  schemas:
+    Problem:
+      type: object
+      description: RFC 9457 problem details
+      required: [type, title, status]
+      properties:
+        type:
+          type: string
+          description: URI reference that identifies the problem type
+          examples: ['urn:chance:problem:validation-failed']
+        title:
+          type: string
+        status:
+          type: integer
+        detail:
+          type: string
+        instance:
+          type: string
+          description: The request path
+        code:
+          type: string
+          description: Machine-readable problem code
+          examples: [validation_failed]
+        errors:
+          type: array
+          description: Invalid fields of a 400 answer
+          items:
+            type: object
+            required: [field, message]
+            properties:
+              field:
+                type: string
+              message:
+                type: string
+    Health:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+          enum: [up]
+    Hash:
+      type: string
+      description: SHA-256 as 64 lower-case hex digits
+      pattern: '^[0-9a-f]{64}$'
+    AuditEntry:
+      type: object
+      description: |
+        One business event as audit recorded it. An entry is written once and never changes. Names of people and
+        e-mail addresses are not in it: events carry ids only.
+      required: [seq, eventId, eventType, source, subject, actor, occurredAt, recordedAt, correlationId, causationId, payload, prevHash, hash]
+      properties:
+        seq:
+          type: integer
+          format: int64
+          minimum: 1
+          description: Number of the entry in the tenant's log, 1, 2, 3 ... without gaps
+        eventId:
+          type: string
+          description: The CloudEvent id; one event is one entry however often the broker redelivers it
+        eventType:
+          type: string
+          description: The CloudEvent type, for example `si.chance.payments.DepositSucceeded.v1`. A type audit does not know is recorded as well.
+        source:
+          type: string
+          description: The CloudEvent source, for example `/chance/payments`
+        subject:
+          type: string
+          description: |
+            The main id of the event: `marketId`, `depositId`, `withdrawalId`, `userId` or `tenantId` of its data,
+            the first that is present in this order; the tenant id when the data holds none of them
+        actor:
+          type: [string, 'null']
+          description: The user who caused the event (`actorId`, `userId` or `adminId` of its data, the first present), or null
+        occurredAt:
+          type: string
+          format: date-time
+          description: The CloudEvent time (the recording time when the event carried none)
+        recordedAt:
+          type: string
+          format: date-time
+          description: When audit stored the entry. It is not part of the hash.
+        correlationId:
+          type: [string, 'null']
+          description: Ties the events of one business operation together across services
+        causationId:
+          type: [string, 'null']
+          description: The request that caused the event
+        payload:
+          description: The `data` of the event exactly as it was received; any JSON value
+        prevHash:
+          $ref: '#/components/schemas/Hash'
+          description: The `hash` of the previous entry; 64 zeros for `seq` 1
+        hash:
+          $ref: '#/components/schemas/Hash'
+          description: SHA-256 over `prevHash` and the canonical text of the other fields (`contracts/README.md`)
+    AuditPage:
+      type: object
+      required: [items, nextCursor]
+      properties:
+        items:
+          type: array
+          description: Newest first
+          items:
+            $ref: '#/components/schemas/AuditEntry'
+        nextCursor:
+          type: [string, 'null']
+          description: Pass it as `cursor` for the next, older page; null on the last page
+    VerifyResult:
+      type: object
+      required: [valid, entries, brokenAtSeq]
+      properties:
+        valid:
+          type: boolean
+          description: True when no entry is wrong (also for a tenant with no entries)
+        entries:
+          type: integer
+          minimum: 0
+          description: How many entries the check read
+        brokenAtSeq:
+          type: [integer, 'null']
+          format: int64
+          description: The `seq` of the first wrong entry; null when the chain is intact

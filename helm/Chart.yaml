@@ -1,0 +1,7 @@
+apiVersion: v2
+name: audit
+description: Audit log of Chance (an append-only, hash-chained record of every business event, per tenant).
+type: application
+# Chart version: bump on every change to the chart. The image tag is set by the pipeline (sha-<commit>).
+version: 0.2.0
+appVersion: "0.1.0"

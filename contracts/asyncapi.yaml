@@ -1,0 +1,178 @@
+asyncapi: 3.0.0
+info:
+  title: Chance audit events (consumed)
+  version: 0.1.0
+  description: |
+    The service audit consumes the business events of the other services from NATS JetStream and publishes none.
+    The events themselves are defined by their publishers; the contracts to read are
+    `tenants/contracts/asyncapi.yaml`, `payments/contracts/asyncapi.yaml`, `markets/contracts/asyncapi.yaml` and the
+    contract of trading. Audit looks only at the CloudEvents envelope, so this file describes the envelope and the
+    channels, not the data of each event.
+
+    - Format: CloudEvents 1.0, structured JSON mode. The message body is the whole CloudEvent.
+    - One durable pull consumer per stream, named `audit-<service>` (`audit-tenants`, `audit-payments`,
+      `audit-markets`, `audit-trading`), with explicit acknowledgement. A message is acknowledged only after its entry
+      is committed to the tenant's log; the id of the event is stored in the same transaction (inbox), so a message
+      that the broker delivers again changes nothing.
+    - A stream that does not exist yet is logged and tried again; the service starts without it.
+    - What is recorded: every event with a valid envelope, **whatever its type** (a type that audit does not know is
+      recorded with its data as received, so a new event of another service needs no change here). A message that is
+      not a CloudEvent with `specversion` `1.0`, an `id`, a `type`, a `source` and a `tenantid` (a UUID), or whose
+      data cannot be stored (a NUL character in a text, nesting deeper than 64 levels), is terminated (it is never
+      redelivered) and logged.
+    - The tenant's schema: `TenantCreated` (stream `TENANTS`) creates the tenant's schema and is recorded as the first
+      entry. An event of a tenant whose schema does not exist yet is negatively acknowledged with a delay, so the
+      broker delivers it again once `TenantCreated` has been processed.
+    - Events of one tenant are appended in the order audit processes them (one append at a time per tenant); a
+      correlation id ties the events of one business operation together.
+defaultContentType: application/json
+servers:
+  nats:
+    host: nats:4222
+    protocol: nats
+    description: NATS server with JetStream, reached by its Kubernetes service name (localhost:4222 in local runs)
+
+channels:
+  tenants:
+    address: chance.tenants.{event}.{tenantId}
+    description: |
+      Stream `TENANTS`, subjects `chance.tenants.>`, published by tenants. Known events: TenantCreated, MemberJoined,
+      MemberRoleChanged. TenantCreated also creates the tenant's schema.
+    parameters:
+      event:
+        description: Name of the event, for example TenantCreated
+      tenantId:
+        description: Id of the tenant (UUID)
+    messages:
+      BusinessEvent:
+        $ref: '#/components/messages/BusinessEvent'
+  payments:
+    address: chance.payments.{event}.{tenantId}
+    description: |
+      Stream `PAYMENTS`, subjects `chance.payments.>`, published by payments. Known events: DepositSucceeded,
+      DepositFailed, WithdrawalSucceeded, WithdrawalFailed.
+    parameters:
+      event:
+        description: Name of the event, for example DepositSucceeded
+      tenantId:
+        description: Id of the tenant (UUID)
+    messages:
+      BusinessEvent:
+        $ref: '#/components/messages/BusinessEvent'
+  markets:
+    address: chance.markets.{event}.{tenantId}
+    description: |
+      Stream `MARKETS`, subjects `chance.markets.>`, published by markets. Known events: MarketOpened, MarketClosed,
+      MarketResolved.
+    parameters:
+      event:
+        description: Name of the event, for example MarketOpened
+      tenantId:
+        description: Id of the tenant (UUID)
+    messages:
+      BusinessEvent:
+        $ref: '#/components/messages/BusinessEvent'
+  trading:
+    address: chance.trading.{event}.{tenantId}
+    description: |
+      Stream `TRADING`, subjects `chance.trading.>`, published by trading. Known events: MarketFunded, TradeExecuted,
+      MarketSettled, WithdrawalRefunded. Trading's internal ledger events are never published. The stream may not exist
+      yet while trading is being built: audit logs that and tries again.
+    parameters:
+      event:
+        description: Name of the event, for example TradeExecuted
+      tenantId:
+        description: Id of the tenant (UUID)
+    messages:
+      BusinessEvent:
+        $ref: '#/components/messages/BusinessEvent'
+
+operations:
+  consumeTenants:
+    action: receive
+    channel:
+      $ref: '#/channels/tenants'
+    summary: Durable consumer `audit-tenants` on the stream TENANTS
+  consumePayments:
+    action: receive
+    channel:
+      $ref: '#/channels/payments'
+    summary: Durable consumer `audit-payments` on the stream PAYMENTS
+  consumeMarkets:
+    action: receive
+    channel:
+      $ref: '#/channels/markets'
+    summary: Durable consumer `audit-markets` on the stream MARKETS
+  consumeTrading:
+    action: receive
+    channel:
+      $ref: '#/channels/trading'
+    summary: Durable consumer `audit-trading` on the stream TRADING
+
+components:
+  messages:
+    BusinessEvent:
+      name: BusinessEvent
+      title: A business event of any publisher
+      contentType: application/json
+      headers:
+        type: object
+        properties:
+          Nats-Msg-Id:
+            type: string
+            description: Equals the CloudEvent id; set by the publisher, not read by audit
+      payload:
+        $ref: '#/components/schemas/CloudEventEnvelope'
+  schemas:
+    CloudEventEnvelope:
+      type: object
+      description: |
+        The CloudEvents 1.0 attributes audit reads. Other attributes are allowed and not recorded; the data is any JSON
+        and is recorded as received.
+      required:
+        - specversion
+        - id
+        - source
+        - type
+        - tenantid
+      properties:
+        specversion:
+          type: string
+          const: '1.0'
+        id:
+          type: string
+          minLength: 1
+          maxLength: 255
+          description: Unique id of the event (UUIDv7 from the publishers); the deduplication key
+        source:
+          type: string
+          minLength: 1
+          maxLength: 255
+          description: For example `/chance/payments`
+        type:
+          type: string
+          minLength: 1
+          maxLength: 255
+          description: For example `si.chance.payments.DepositSucceeded.v1`; any value is recorded
+        time:
+          type: string
+          format: date-time
+          description: When the event occurred; the recording time is used when it is missing or invalid
+        tenantid:
+          type: string
+          format: uuid
+          description: Tenant context (extension attribute); chooses the tenant's log
+        correlationid:
+          type: string
+          minLength: 1
+          maxLength: 255
+          description: Ties the events of one business operation together (extension attribute); kept when 1 to 255 characters
+        causationid:
+          type: string
+          minLength: 1
+          maxLength: 255
+          description: Id of the request that caused the event (extension attribute); kept when 1 to 255 characters
+        data:
+          description: |
+            Recorded as received (an empty object when absent). Its `marketId`, `depositId`, `withdrawalId`, `userId`
+            and `tenantId` give the subject of the entry, its `actorId`, `userId` and `adminId` the actor.
